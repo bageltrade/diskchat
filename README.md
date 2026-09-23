@@ -1,4 +1,4 @@
-# DiskChat Agent v2.2
+# DiskChat Agent v2.3
 
 **Ultra-low-RAM local LLM** with **tool calling** and an optional **HTTP API**.
 
@@ -30,6 +30,43 @@ Weights stay on **disk** (mmap). Process RAM stays tiny even for multi‑GB GGUF
 When the GGUF is larger than physical RAM, the OS **pages** weights from disk (slower, still correct).
 
 ---
+
+
+
+## App-ready: pass a GGUF directly
+
+DiskChat accepts a model file the way a mobile app would hand it over:
+
+```bash
+# positional (share-sheet / file picker style)
+python diskchat.py /sdcard/Download/qwen2.5-1.5b-instruct-q4_k_m.gguf --doctor
+python diskchat.py /path/to/model.gguf --extreme-low-ram --once "Hi"
+
+# flags (aliases)
+python diskchat.py --gguf /path/to/model.gguf --doctor
+python diskchat.py --model /path/to/model.gguf --doctor
+
+# file:// URIs OK
+python diskchat.py --gguf 'file:///storage/emulated/0/Download/model.gguf' --doctor
+
+# scan known folders (Download, ~/.cache/diskchat/models, ...)
+python diskchat.py --list-models
+```
+
+Also accepted:
+- directory of split shards (`*-00001-of-*.gguf`)
+- bare filename if it exists under `DISKCHAT_MODEL_DIR` or Download
+
+Env for apps:
+| Variable | Meaning |
+|----------|---------|
+| `DISKCHAT_MODEL` | default GGUF path |
+| `DISKCHAT_MODEL_DIR` | folder to scan / resolve bare names |
+| `DISKCHAT_LLAMA_CLI` | path to `llama-cli` |
+| `DISKCHAT_LIB_DIR` | shared libs next to the binary |
+
+Phone tip: keep quant small enough for free RAM (see extreme-low-ram). Watchdog-style guards should track **llama-cli RSS**, not only the Python parent.
+
 
 ## Install
 

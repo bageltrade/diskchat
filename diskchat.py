@@ -11,6 +11,9 @@ Extreme-low-RAM mode: auto budget for multi-GB / 7B–70B-class GGUFs via mmap.
   python diskchat.py --agent --once "What is 17*19?"
   python diskchat.py --serve --port 8765 --agent
   python diskchat.py --profile coding --agent
+  python diskchat.py /path/to/model.gguf --once "Hi"   # direct GGUF (app)
+  python diskchat.py --gguf /sdcard/Download/model.gguf --doctor
+  python diskchat.py --list-models
 """
 from __future__ import annotations
 
@@ -36,7 +39,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 
 def _project_root() -> Path:
@@ -167,21 +170,176 @@ def estimate_params_b(model_path: str) -> float:
     return round((mb / 1024.0) / 0.6, 2)
 
 
+def normalize_model_input(raw: str) -> str:
+    """Accept paths an app might hand us: file://, quotes, ~, content-ish paths."""
+    s = (raw or "").strip().strip('"').strip("'")
+    if not s:
+        return s
+    # file:///storage/... or file://localhost/...
+    if s.lower().startswith("file:"):
+        from urllib.parse import unquote, urlparse
+        u = urlparse(s)
+        path = unquote(u.path or "")
+        # Windows-ish file:///C:/... → keep; Android file:///storage → path starts /
+        if path.startswith("/") and len(path) > 2 and path[2] == ":":
+            path = path[1:]  # /C:/ → C:/
+        s = path or s
+    if s.startswith("~"):
+        s = str(Path(s).expanduser())
+    return s
+
+
+def is_gguf_file(path: Path) -> bool:
+    """True if path looks like a readable GGUF (magic GGUF)."""
+    try:
+        if not path.is_file():
+            return False
+        if path.suffix.lower() != ".gguf" and ".gguf" not in path.name.lower():
+            # still check magic — some app share names without suffix
+            pass
+        with open(path, "rb") as f:
+            magic = f.read(4)
+        return magic == b"GGUF"
+    except OSError:
+        return False
+
+
+def discover_gguf_dirs() -> list[Path]:
+    """Search roots useful for CLI + future mobile app storage."""
+    roots: list[Path] = []
+    env = os.environ.get("DISKCHAT_MODEL_DIR", "")
+    if env:
+        roots.append(Path(env))
+    roots.extend(
+        [
+            Path.home() / ".cache" / "diskchat" / "models",
+            _project_root() / "models",
+            Path("/tmp/diskchat-models"),
+            Path.home() / "Download",
+            Path.home() / "Downloads",
+            Path("/sdcard/Download"),
+            Path("/storage/emulated/0/Download"),
+            Path("/storage/emulated/0/DiskChat/models"),
+        ]
+    )
+    # de-dupe existing
+    out: list[Path] = []
+    seen = set()
+    for r in roots:
+        try:
+            key = str(r.resolve()) if r.exists() else str(r)
+        except OSError:
+            key = str(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def list_gguf_models(limit: int = 50) -> list[dict]:
+    """Scan known dirs for .gguf files (app model picker helper)."""
+    found: list[dict] = []
+    for root in discover_gguf_dirs():
+        if not root.is_dir():
+            continue
+        try:
+            for p in sorted(root.rglob("*.gguf")):
+                if not p.is_file():
+                    continue
+                try:
+                    sz = p.stat().st_size
+                except OSError:
+                    continue
+                found.append(
+                    {
+                        "path": str(p.resolve()),
+                        "name": p.name,
+                        "size_mb": round(sz / (1024 * 1024), 1),
+                        "valid_magic": is_gguf_file(p),
+                    }
+                )
+                if len(found) >= limit:
+                    return found
+        except OSError:
+            continue
+    return found
+
+
 def resolve_gguf_path(model_path: str) -> str:
-    """Support split GGUFs: dir or *-00001-of-*.gguf (llama.cpp loads siblings)."""
-    path = Path(model_path)
+    """Resolve a user/app GGUF reference to a concrete file path.
+
+    Accepts:
+      - absolute/relative path to .gguf
+      - file:// URI
+      - directory containing .gguf (picks first shard / first file)
+      - bare filename found under DISKCHAT_MODEL_DIR / Download / models/
+      - split GGUF: any shard or *-00001-of-*.gguf (llama.cpp loads siblings)
+    """
+    raw = normalize_model_input(model_path)
+    if not raw:
+        return model_path
+
+    path = Path(raw)
+
+    # Directory → first shard or first gguf
     if path.is_dir():
         parts = sorted(path.glob("*.gguf"))
         if not parts:
-            return model_path
+            return str(path)
         ones = [p for p in parts if "00001-of-" in p.name or "-00001-" in p.name]
-        return str(ones[0] if ones else parts[0])
+        return str((ones[0] if ones else parts[0]).resolve())
+
+    # Existing file
     if path.is_file():
-        return str(path)
-    matches = sorted(Path().glob(model_path)) if any(c in model_path for c in "*?") else []
-    if matches:
-        return str(matches[0])
-    return model_path
+        return str(path.resolve())
+
+    # Glob from cwd
+    if any(c in raw for c in "*?"):
+        matches = sorted(Path().glob(raw))
+        files = [m for m in matches if m.is_file()]
+        if files:
+            return str(files[0].resolve())
+
+    # Bare name / relative: search known model dirs
+    name = path.name
+    for root in discover_gguf_dirs():
+        if not root.is_dir():
+            continue
+        cand = root / name
+        if cand.is_file():
+            return str(cand.resolve())
+        # also allow unique suffix match
+        try:
+            hits = list(root.glob(f"**/{name}"))
+            hits = [h for h in hits if h.is_file()]
+            if len(hits) == 1:
+                return str(hits[0].resolve())
+        except OSError:
+            pass
+
+    return str(path) if path.is_absolute() else raw
+
+
+def accept_gguf(model_path: str, *, require_magic: bool = True) -> str:
+    """App-facing entry: resolve + validate GGUF or raise clear error."""
+    resolved = resolve_gguf_path(model_path)
+    path = Path(resolved)
+    if not path.is_file():
+        hint = list_gguf_models(limit=5)
+        msg = f"GGUF not found: {model_path!r} (resolved: {resolved})"
+        if hint:
+            msg += "\nNearby models:\n" + "\n".join(
+                f"  - {h['path']} ({h['size_mb']} MB)" for h in hint
+            )
+        raise FileNotFoundError(msg)
+    if require_magic and not is_gguf_file(path):
+        raise ValueError(
+            f"Not a valid GGUF file (bad magic): {path}\n"
+            "Pick a .gguf model file exported for llama.cpp."
+        )
+    return str(path.resolve())
+
 
 
 def total_gguf_mb(model_path: str) -> float:
@@ -826,7 +984,7 @@ class DiskChatEngine:
         self.cfg = cfg
         self.tools = tools or ToolRegistry()
         # Split / multi-part GGUF support
-        cfg.model_path = resolve_gguf_path(cfg.model_path)
+        cfg.model_path = accept_gguf(cfg.model_path, require_magic=False)
         self.conv = Conversation(system=self._build_system())
         model = Path(cfg.model_path)
         cli = Path(cfg.llama_cli)
@@ -1338,8 +1496,21 @@ def load_config_file(path: str) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=f"DiskChat Agent v{VERSION}")
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap = argparse.ArgumentParser(
+        description=f"DiskChat Agent v{VERSION} — pass any GGUF path (app-ready)",
+    )
+    ap.add_argument(
+        "gguf",
+        nargs="?",
+        default="",
+        help="GGUF file path (positional). Same as --model / --gguf",
+    )
+    ap.add_argument(
+        "--model", "--gguf",
+        dest="model",
+        default=DEFAULT_MODEL,
+        help="Path to .gguf (or directory of shards). Accepts file:// and bare filenames",
+    )
     ap.add_argument("--llama-cli", default=DEFAULT_LLAMA_CLI)
     ap.add_argument("--lib-dir", default=DEFAULT_LIB_DIR)
     ap.add_argument("--ctx", type=int, default=DEFAULT_CTX)
@@ -1360,6 +1531,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--doctor", action="store_true")
     ap.add_argument("--list-tools", action="store_true")
+    ap.add_argument("--list-models", action="store_true", help="scan for GGUF files (app picker)")
     ap.add_argument("--serve", action="store_true", help="start HTTP API for agents")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
@@ -1369,6 +1541,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="max RAM budget in MB (0 = auto from MemAvailable)")
     ap.add_argument("--version", action="store_true")
     args = ap.parse_args(argv)
+
+    # Positional GGUF wins (app / share-sheet style: diskchat.py /path/to/model.gguf)
+    if getattr(args, "gguf", ""):
+        args.model = args.gguf
+
+    if getattr(args, "list_models", False):
+        models = list_gguf_models()
+        if not models:
+            print("No GGUF files found in search paths:")
+            for d in discover_gguf_dirs():
+                print(f"  - {d}")
+            return 1
+        for h in models:
+            flag = "OK" if h["valid_magic"] else "??"
+            print(f"[{flag}] {h['size_mb']:8.1f} MB  {h['path']}")
+        return 0
 
     if args.version:
         print(VERSION)
