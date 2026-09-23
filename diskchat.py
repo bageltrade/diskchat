@@ -39,7 +39,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 
 def _project_root() -> Path:
@@ -322,7 +322,10 @@ def resolve_gguf_path(model_path: str) -> str:
 
 
 def accept_gguf(model_path: str, *, require_magic: bool = True) -> str:
-    """App-facing entry: resolve + validate GGUF or raise clear error."""
+    """App-facing entry: resolve + validate GGUF (incl. complete split sets).
+
+    Returns the **primary** path (00001 shard for splits) for llama-cli.
+    """
     resolved = resolve_gguf_path(model_path)
     path = Path(resolved)
     if not path.is_file():
@@ -333,36 +336,121 @@ def accept_gguf(model_path: str, *, require_magic: bool = True) -> str:
                 f"  - {h['path']} ({h['size_mb']} MB)" for h in hint
             )
         raise FileNotFoundError(msg)
-    if require_magic and not is_gguf_file(path):
-        raise ValueError(
-            f"Not a valid GGUF file (bad magic): {path}\n"
-            "Pick a .gguf model file exported for llama.cpp."
-        )
-    return str(path.resolve())
 
+    info = validate_split_gguf(str(path))
+    if info["split"] and info["missing"]:
+        raise FileNotFoundError(
+            f"Incomplete split GGUF: found {info['found']}/{info['expected']} shards.\n"
+            f"Missing: {', '.join(info['missing'])}\n"
+            f"Primary: {info.get('primary') or path}"
+        )
+    if require_magic:
+        if info["split"]:
+            for s in info["shards"]:
+                if not is_gguf_file(Path(s)):
+                    raise ValueError(f"Not a valid GGUF (bad magic): {s}")
+        else:
+            check = Path(info["primary"]) if info.get("primary") else path
+            if not is_gguf_file(check):
+                raise ValueError(
+                    f"Not a valid GGUF file (bad magic): {check}\n"
+                    "Pick a .gguf model file exported for llama.cpp."
+                )
+    return info["primary"] or str(path.resolve())
+
+
+
+def parse_split_name(name: str):
+    """Parse 'prefix-00001-of-00003.gguf' -> (prefix, index, total) or None."""
+    m = re.search(r"^(.*?)-(\d+)-of-(\d+)\.gguf$", name, re.I)
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), int(m.group(3))
+
+
+def list_gguf_shards(model_path: str):
+    """Return all shard paths for a split GGUF (or [single] if not split)."""
+    path = Path(resolve_gguf_path(model_path))
+    if not path.is_file():
+        return []
+    parsed = parse_split_name(path.name)
+    if not parsed:
+        return [path]
+    prefix, _idx, total = parsed
+    return [path.parent / f"{prefix}-{i:05d}-of-{total:05d}.gguf" for i in range(1, total + 1)]
+
+
+def validate_split_gguf(model_path: str) -> dict:
+    """Validate split set is complete; return status dict for doctor/app."""
+    path = Path(resolve_gguf_path(model_path))
+    info = {
+        "path": str(path) if path.is_file() else model_path,
+        "split": False,
+        "expected": 1,
+        "found": 0,
+        "missing": [],
+        "shards": [],
+        "total_mb": 0.0,
+        "ok": False,
+        "primary": "",
+    }
+    if not path.is_file():
+        info["missing"] = [str(path)]
+        return info
+    shards = list_gguf_shards(str(path))
+    parsed = parse_split_name(path.name)
+    if not parsed:
+        info["found"] = 1
+        info["shards"] = [str(path.resolve())]
+        info["primary"] = str(path.resolve())
+        info["total_mb"] = path.stat().st_size / (1024 * 1024)
+        info["ok"] = is_gguf_file(path)
+        return info
+    _prefix, _idx, total = parsed
+    info["split"] = True
+    info["expected"] = total
+    present = []
+    missing = []
+    for s in shards:
+        if s.is_file():
+            present.append(s)
+        else:
+            missing.append(s.name)
+    info["found"] = len(present)
+    info["missing"] = missing
+    info["shards"] = [str(s.resolve()) for s in present]
+    info["total_mb"] = sum(s.stat().st_size for s in present) / (1024 * 1024)
+    first = path.parent / f"{parsed[0]}-00001-of-{total:05d}.gguf"
+    if first.is_file():
+        info["primary"] = str(first.resolve())
+    elif present:
+        info["primary"] = str(present[0].resolve())
+    info["ok"] = (
+        len(missing) == 0
+        and len(present) == total
+        and all(is_gguf_file(s) for s in present)
+    )
+    return info
 
 
 def total_gguf_mb(model_path: str) -> float:
     """Sum size of all shards if this is a split GGUF; else single-file size."""
+    info = validate_split_gguf(model_path)
+    if info["total_mb"] > 0:
+        return float(info["total_mb"])
     path = Path(resolve_gguf_path(model_path))
-    if not path.is_file():
-        return 0.0
-    name = path.name
-    # e.g. name-00001-of-00002.gguf
-    if "-of-" in name:
-        # sibling shards share the same directory + prefix before -0000x-
-        import re as _re
-        m = _re.search(r"(.*?)-(\d+)-of-(\d+)\.gguf$", name, _re.I)
-        if m:
-            prefix, _idx, total = m.group(1), m.group(2), int(m.group(3))
-            total_mb = 0.0
-            for i in range(1, total + 1):
-                sib = path.parent / f"{prefix}-{i:05d}-of-{total:05d}.gguf"
-                if sib.is_file():
-                    total_mb += sib.stat().st_size / (1024 * 1024)
-            if total_mb > 0:
-                return total_mb
-    return path.stat().st_size / (1024 * 1024)
+    if path.is_file():
+        return path.stat().st_size / (1024 * 1024)
+    return 0.0
+
+
+def primary_gguf_path(model_path: str) -> str:
+    """Path llama-cli should open (always shard 00001 for splits)."""
+    info = validate_split_gguf(model_path)
+    if info.get("primary"):
+        return info["primary"]
+    return resolve_gguf_path(model_path)
+
 
 
 @dataclass
@@ -1243,7 +1331,13 @@ def run_doctor(cfg: EngineConfig) -> int:
     model = Path(cfg.model_path)
     cli = Path(cfg.llama_cli)
     lib = Path(cfg.lib_dir)
-    print(f"  model    : {model}  exists={model.is_file()}  size={total_gguf_mb(str(model)) or file_mb(str(model)):.0f}MB")
+    split_info = validate_split_gguf(str(model))
+    print(f"  model    : {model}  exists={model.is_file()}  size={split_info['total_mb'] or file_mb(str(model)):.0f}MB")
+    if split_info["split"]:
+        st = "OK" if split_info["ok"] else "INCOMPLETE"
+        print(f"  split    : {split_info['found']}/{split_info['expected']} shards  [{st}]  primary={split_info['primary']}")
+        if split_info["missing"]:
+            print(f"  missing  : {', '.join(split_info['missing'])}")
     if not model.is_file():
         print("  !! set DISKCHAT_MODEL or run scripts/download_model.py")
         ok = False
@@ -1408,6 +1502,40 @@ def serve_http(engine: DiskChatEngine, tools: ToolRegistry, host: str, port: int
 
 def run_selftest(cfg: EngineConfig) -> int:
     print(f"=== DiskChat v{VERSION} self-test ===")
+
+    # --- split GGUF path logic (synthetic tiny files) ---
+    import tempfile
+    import shutil
+    td = Path(tempfile.mkdtemp(prefix="diskchat-split-"))
+    try:
+        prefix = "toy-model"
+        total = 3
+        for i in range(1, total + 1):
+            fp = td / f"{prefix}-{i:05d}-of-{total:05d}.gguf"
+            fp.write_bytes(b"GGUF" + b"\0" * 64)
+        mid = td / f"{prefix}-00002-of-{total:05d}.gguf"
+        primary = primary_gguf_path(str(mid))
+        assert primary.endswith("00001-of-00003.gguf"), primary
+        info = validate_split_gguf(str(mid))
+        assert info["split"] and info["ok"] and info["found"] == 3
+        (td / f"{prefix}-00003-of-{total:05d}.gguf").unlink()
+        info2 = validate_split_gguf(str(mid))
+        assert not info2["ok"] and any("00003" in x for x in info2["missing"])
+        try:
+            accept_gguf(str(mid), require_magic=True)
+            raise AssertionError("accept_gguf should fail on incomplete split")
+        except FileNotFoundError:
+            pass
+        (td / f"{prefix}-00003-of-{total:05d}.gguf").write_bytes(b"GGUF" + b"\0" * 64)
+        got = accept_gguf(str(mid), require_magic=True)
+        assert "00001" in got
+        dprim = resolve_gguf_path(str(td))
+        assert "00001" in dprim
+        print("  PASS  split GGUF resolve/validate/accept")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
     assert Path(cfg.model_path).is_file(), "model missing"
     fmb = file_mb(cfg.model_path)
     print(f"  model disk={fmb:.0f}MB  max_ctx={cfg.max_context}  host={mem_snapshot()}")

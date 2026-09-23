@@ -1,4 +1,4 @@
-# DiskChat Agent v2.3
+# DiskChat Agent v2.4
 
 **Ultra-low-RAM local LLM** with **tool calling** and an optional **HTTP API**.
 
@@ -169,3 +169,18 @@ python diskchat.py --extreme-low-ram --ram-budget 900 --once "Hello"
 ## License
 
 MIT (Python). `llama.cpp` and model weights follow their own licenses.
+
+
+## Split GGUF
+
+Multi-part models (`*-00001-of-0000N.gguf`) are fully supported:
+
+```bash
+# any shard path works — DiskChat selects 00001 for llama-cli
+python diskchat.py --gguf /models/qwen-7b-q4-00002-of-00002.gguf --doctor
+
+# incomplete sets are rejected with a clear missing-shard error
+python diskchat.py --gguf /models/partial-00001-of-00003.gguf --doctor
+```
+
+`validate_split_gguf()` / `--doctor` report `found/expected` and total size across shards.
