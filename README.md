@@ -1,21 +1,33 @@
-# DiskChat Agent v2.1
+# DiskChat Agent v2.2
 
-**Ultra-low-RAM local LLM** with **tool calling** and an optional **HTTP API** for outer agents.
+**Ultra-low-RAM local LLM** with **tool calling** and an optional **HTTP API**.
 
-Supports **Linux x86_64** and **Linux aarch64 (arm64)**.
+**Linux x86_64** and **Linux aarch64 (arm64)**.
 
-**v2.1:** extreme-low-RAM mode for **multi-GB / 7B–70B-class** GGUFs (auto RAM budget, tiny KV, mmap paging, split GGUF support).
+Weights stay on **disk** (mmap). Process RAM stays tiny even for multi‑GB GGUFs.
 
 | Capability | Detail |
 |------------|--------|
-| Weights | GGUF **mmap** (not fully loaded into RAM) |
+| Weights | GGUF **mmap** (never `mlock`) |
 | Context | Adaptive, ceiling **131072** |
 | KV cache | `q8_0` / `f16` |
 | Tools | 11 builtins + pluggable registry |
 | Agent API | CLI + **HTTP** `/v1/chat` |
-| Sessions | `/save` `/load` |
-| Profiles | `default` `coding` `creative` `agent` |
+| Large models | `--extreme-low-ram`, split GGUF, auto RAM plan |
 | Platforms | Linux **x86_64**, **aarch64** |
+
+---
+
+## Verified on a 1.2 GB RAM host
+
+| Model | Quant | Disk | Parent RSS | Result |
+|-------|--------|------|------------|--------|
+| Qwen2.5-1.5B | Q4_K_M | ~1.1 GB | ~11–14 MB | OK |
+| Qwen2.5-3B | Q2_K | ~1.3 GB | ~20–22 MB | OK |
+| Qwen2.5-3B | Q4_K_M | ~2.0 GB | ~20 MB | OK |
+| **Qwen2.5-7B** | **Q4_K_M** (split) | **~4.4 GB** | **~20 MB** | OK (`2+2` → `4`) |
+
+When the GGUF is larger than physical RAM, the OS **pages** weights from disk (slower, still correct).
 
 ---
 
@@ -25,11 +37,13 @@ Supports **Linux x86_64** and **Linux aarch64 (arm64)**.
 git clone https://github.com/bageltrade/diskchat.git
 cd diskchat
 
-# Runtime for your CPU (x86_64 or aarch64)
-bash scripts/install_runtime.sh
-
+bash scripts/install_runtime.sh          # x86_64 or aarch64
 pip install -r requirements.txt
-python scripts/download_model.py
+
+# Models
+python scripts/download_model.py --preset tiny    # 1.5B Q4
+python scripts/download_model.py --preset small   # 3B Q4
+python scripts/download_model.py --preset medium  # 7B Q4 split (~4.4 GB)
 
 export DISKCHAT_LLAMA_CLI="$PWD/bin/llama-cli"
 export DISKCHAT_LIB_DIR="$PWD/bin"
@@ -40,130 +54,65 @@ python diskchat.py --doctor
 python diskchat.py --selftest
 ```
 
-### Architecture matrix
+### Architecture
 
-| `uname -m` | Binary selected by `install_runtime.sh` |
-|------------|-------------------------------------------|
-| `x86_64` | `llama-*-bin-ubuntu-x64.tar.gz` |
-| `aarch64` | `llama-*-bin-ubuntu-arm64.tar.gz` |
+| `uname -m` | Runtime |
+|------------|---------|
+| `x86_64` | `llama-*-bin-ubuntu-x64` |
+| `aarch64` | `llama-*-bin-ubuntu-arm64` |
 
 ---
 
 ## Usage
 
 ```bash
-# Plain chat
 python diskchat.py --once "Hello"
-
-# Tool agent
 python diskchat.py --agent --once "What is 17*19? Use tools."
-
-# Profiles
 python diskchat.py --profile coding --agent
-python diskchat.py --profile creative
-
-# HTTP API for external agents / apps
 python diskchat.py --serve --agent --port 8765
 
-# Diagnostics
-python diskchat.py --doctor
-python diskchat.py --list-tools
-python diskchat.py --version
+# Huge GGUF on small RAM
+python diskchat.py --extreme-low-ram --doctor
+python diskchat.py --extreme-low-ram --ram-budget 2048 --once "Hi"
+python diskchat.py --extreme-low-ram --once "What is 2+2?"
 ```
 
-### Interactive commands
+### Interactive
 
-| Command | Action |
-|---------|--------|
-| `/reset` | Clear history |
-| `/mem` | RAM snapshot |
-| `/tools` | List tools |
-| `/save [name]` | Save session |
-| `/load [name]` | Load session |
-| `/quit` | Exit |
+`/reset` `/mem` `/tools` `/save [name]` `/load [name]` `/quit`
 
 ### HTTP API
 
 ```bash
-# Health
 curl http://127.0.0.1:8765/health
-
-# Chat
-curl -s http://127.0.0.1:8765/v1/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"What is 2+2?"}'
-
-# Tools schema (OpenAI-style)
+curl -s http://127.0.0.1:8765/v1/chat -H 'Content-Type: application/json' \
+  -d '{"message":"Hello"}'
 curl http://127.0.0.1:8765/v1/tools
-
-# Reset conversation
 curl -X POST http://127.0.0.1:8765/v1/reset
 ```
 
-Also accepts OpenAI-ish body: `{"messages":[{"role":"user","content":"..."}]}`.
-
 ---
 
-## Built-in tools (11)
-
-`calculator` · `get_time` · `list_dir` · `read_file` · `write_file` · `memory_stats` · `echo` · **`http_get`** · **`search_workspace`** · **`glob_files`** · **`platform_info`**
-
-Workspace: `~/.cache/diskchat/workspace` (override with `DISKCHAT_WORKSPACE`).
-
-Parallel tool execution is enabled by default when the model emits multiple calls.
-
-### Register custom tools
-
-```python
-import importlib.util
-from pathlib import Path
-spec = importlib.util.spec_from_file_location("diskchat", Path("diskchat.py"))
-dc = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(dc)
-
-reg = dc.ToolRegistry.with_builtins()
-reg.register("my_tool", lambda x="": {"ok": x}, "desc",
-             {"type":"object","properties":{"x":{"type":"string"}}})
-```
-
----
-
-
----
-
-## Extreme low RAM (large models)
-
-DiskChat never `mlock`s weights. For **huge GGUFs** on small machines:
+## Extreme low RAM (7B+ / multi‑GB)
 
 ```bash
-# Auto-tune ctx/batch from free RAM + model size
-python diskchat.py --extreme-low-ram --doctor
-python diskchat.py --extreme-low-ram --once "Hello"
-
-# Or set an explicit budget (MB)
-python diskchat.py --ram-budget 2048 --extreme-low-ram --agent
-
-# Large quant downloads (Q2/Q3 preferred)
-python scripts/download_model.py --preset large    # ~14B Q2
-python scripts/download_model.py --preset xlarge   # ~32B Q2
+python diskchat.py --extreme-low-ram --ram-budget 900 --once "Hello"
 ```
 
 | Knob | Effect |
 |------|--------|
-| `--extreme-low-ram` | ctx≤1024, batch 16/8, few threads, small `n_predict` |
-| `--ram-budget MB` | plan KV from this ceiling instead of MemAvailable |
-| mmap weights | OS pages tensors from disk when RAM is tight |
-| split GGUF | pass `...-00001-of-00002.gguf` or a directory of shards |
+| `--extreme-low-ram` | tiny KV/batch/threads |
+| `--ram-budget MB` | plan from this ceiling |
+| split GGUF | pass `…-00001-of-00002.gguf` (siblings auto-loaded) |
+| mmap | OS pages weights when file ≫ RAM |
 
-**Honest limit:** if the GGUF is much larger than physical RAM, inference **works** but becomes **disk-bound** (slow). Prefer **Q2/Q3** quants and **short context** on 8–16 GB hosts for 12B–32B models.
+**Honest limit:** correct answers still work when the file is larger than RAM; expect **disk-bound** speed.
 
-## Low RAM design
+---
 
-1. Model weights → OS **mmap** (never `--mlock`)
-2. KV → quantized K, F16 V
-3. Context → **adaptive** (only prompt + reply size, not full 131k every turn)
+## Tools (11)
 
-Typical: **~1 GB model on disk**, **~10–20 MB parent RSS**.
+`calculator` · `get_time` · `list_dir` · `read_file` · `write_file` · `memory_stats` · `echo` · `http_get` · `search_workspace` · `glob_files` · `platform_info`
 
 ---
 
@@ -171,27 +120,15 @@ Typical: **~1 GB model on disk**, **~10–20 MB parent RSS**.
 
 | Variable | Meaning |
 |----------|---------|
-| `DISKCHAT_MODEL` | GGUF path |
-| `DISKCHAT_LLAMA_CLI` | `llama-cli` path |
-| `DISKCHAT_LIB_DIR` | Shared libs dir |
-| `DISKCHAT_WORKSPACE` | File-tool sandbox |
-| `DISKCHAT_SESSIONS` | Session JSON dir |
-| `LD_LIBRARY_PATH` | Include bin dir |
+| `DISKCHAT_MODEL` | GGUF path (first shard OK for splits) |
+| `DISKCHAT_LLAMA_CLI` | `llama-cli` |
+| `DISKCHAT_LIB_DIR` | shared libs |
+| `DISKCHAT_WORKSPACE` | file-tool sandbox |
+| `DISKCHAT_SESSIONS` | session JSON dir |
+| `LD_LIBRARY_PATH` | include bin dir |
 
 ---
 
-## Project layout
-
-```
-diskchat/
-  diskchat.py
-  scripts/install_runtime.sh    # x86_64 + aarch64
-  scripts/download_model.py
-  requirements.txt
-  README.md
-  LICENSE
-```
-
 ## License
 
-MIT (Python code). `llama.cpp` and model weights follow their own licenses.
+MIT (Python). `llama.cpp` and model weights follow their own licenses.

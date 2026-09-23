@@ -36,7 +36,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 
 def _project_root() -> Path:
@@ -174,16 +174,37 @@ def resolve_gguf_path(model_path: str) -> str:
         parts = sorted(path.glob("*.gguf"))
         if not parts:
             return model_path
-        # Prefer first shard
         ones = [p for p in parts if "00001-of-" in p.name or "-00001-" in p.name]
         return str(ones[0] if ones else parts[0])
     if path.is_file():
         return str(path)
-    # Glob pattern
     matches = sorted(Path().glob(model_path)) if any(c in model_path for c in "*?") else []
     if matches:
         return str(matches[0])
     return model_path
+
+
+def total_gguf_mb(model_path: str) -> float:
+    """Sum size of all shards if this is a split GGUF; else single-file size."""
+    path = Path(resolve_gguf_path(model_path))
+    if not path.is_file():
+        return 0.0
+    name = path.name
+    # e.g. name-00001-of-00002.gguf
+    if "-of-" in name:
+        # sibling shards share the same directory + prefix before -0000x-
+        import re as _re
+        m = _re.search(r"(.*?)-(\d+)-of-(\d+)\.gguf$", name, _re.I)
+        if m:
+            prefix, _idx, total = m.group(1), m.group(2), int(m.group(3))
+            total_mb = 0.0
+            for i in range(1, total + 1):
+                sib = path.parent / f"{prefix}-{i:05d}-of-{total:05d}.gguf"
+                if sib.is_file():
+                    total_mb += sib.stat().st_size / (1024 * 1024)
+            if total_mb > 0:
+                return total_mb
+    return path.stat().st_size / (1024 * 1024)
 
 
 @dataclass
@@ -219,7 +240,7 @@ def plan_ram_budget(
     """
     model_path = resolve_gguf_path(model_path)
     m = mem_snapshot()
-    model_mb = file_mb(model_path)
+    model_mb = total_gguf_mb(model_path) or file_mb(model_path)
     avail = ram_budget_mb if ram_budget_mb and ram_budget_mb > 0 else m.sys_avail_mb
     params_b = estimate_params_b(model_path)
 
@@ -816,7 +837,7 @@ class DiskChatEngine:
         Path(cfg.prompt_cache_dir).mkdir(parents=True, exist_ok=True)
         WORKSPACE.mkdir(parents=True, exist_ok=True)
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
-        self._model_mb = file_mb(cfg.model_path)
+        self._model_mb = total_gguf_mb(cfg.model_path) or file_mb(cfg.model_path)
         self._ram_plan: RamPlan | None = None
         if cfg.extreme_low_ram or cfg.ram_budget_mb > 0 or self._model_mb >= 5000:
             plan = plan_ram_budget(
@@ -1064,7 +1085,7 @@ def run_doctor(cfg: EngineConfig) -> int:
     model = Path(cfg.model_path)
     cli = Path(cfg.llama_cli)
     lib = Path(cfg.lib_dir)
-    print(f"  model    : {model}  exists={model.is_file()}  size={file_mb(str(model)):.0f}MB")
+    print(f"  model    : {model}  exists={model.is_file()}  size={total_gguf_mb(str(model)) or file_mb(str(model)):.0f}MB")
     if not model.is_file():
         print("  !! set DISKCHAT_MODEL or run scripts/download_model.py")
         ok = False
