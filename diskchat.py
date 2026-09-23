@@ -1532,8 +1532,10 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def serve_http(engine: DiskChatEngine, tools: ToolRegistry, host: str, port: int) -> None:
+def serve_http(engine: DiskChatEngine | None, tools: ToolRegistry, host: str, port: int) -> None:
     _ApiState.engine = engine
+    print(f"Web UI → http://{host}:{port}/")
+    print(f"API    → http://{host}:{port}/v1/chat")
     _ApiState.tools = tools
     handler = make_handler()
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -1816,12 +1818,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"         {plan.note}")
     print("cmds    : /reset /mem /tools /save [n] /load [n] /quit\n")
 
+    engine = None
     try:
         engine = DiskChatEngine(cfg, tools=tools)
     except FileNotFoundError as e:
-        print(f"[error] {e}")
-        print("Run: python diskchat.py --doctor")
-        return 1
+        if args.serve:
+            print(f"[warn] model not ready: {e}")
+            print("[warn] starting web UI anyway — set model path in the app")
+        else:
+            print(f"[error] {e}")
+            print("Run: python diskchat.py --doctor")
+            return 1
 
     if args.serve:
         serve_http(engine, tools, args.host, args.port)
