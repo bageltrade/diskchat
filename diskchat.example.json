@@ -1,0 +1,7 @@
+{
+  "model": "/home/you/.cache/diskchat/models/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  "llama_cli": "./bin/llama-cli",
+  "lib_dir": "./bin",
+  "temperature": 0.3,
+  "n_predict": 256
+}
