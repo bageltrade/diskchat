@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.DiskChat" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#0b0f14</item>
+        <item name="android:navigationBarColor">#0b0f14</item>
+        <item name="android:windowBackground">#0b0f14</item>
+        <item name="colorPrimary">#6ee7b7</item>
+    </style>
+</resources>
