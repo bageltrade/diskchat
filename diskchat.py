@@ -4,6 +4,7 @@ DiskChat Agent v2 — ultra-low-RAM mmap LLM + tools + HTTP API
 =============================================================
 Linux x86_64 & aarch64. Weights mmap'd from disk. Adaptive ctx ≤131k.
 Tool-calling agent + optional local HTTP server for outer agents.
+Extreme-low-RAM mode: auto budget for multi-GB / 7B–70B-class GGUFs via mmap.
 
   python diskchat.py --selftest
   python diskchat.py --doctor
@@ -35,7 +36,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 
 def _project_root() -> Path:
@@ -152,6 +153,137 @@ def file_mb(path: str) -> float:
         return Path(path).stat().st_size / (1024 * 1024)
     except OSError:
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Extreme low-RAM planner (large GGUFs on small machines)
+# ---------------------------------------------------------------------------
+def estimate_params_b(model_path: str) -> float:
+    """Rough parameter count (billions) from GGUF file size (Q4-ish heuristic)."""
+    mb = file_mb(model_path)
+    if mb <= 0:
+        return 0.0
+    # Q4_K ≈ 0.55–0.65 bytes/param → params_b ≈ size_gb / 0.6
+    return round((mb / 1024.0) / 0.6, 2)
+
+
+def resolve_gguf_path(model_path: str) -> str:
+    """Support split GGUFs: dir or *-00001-of-*.gguf (llama.cpp loads siblings)."""
+    path = Path(model_path)
+    if path.is_dir():
+        parts = sorted(path.glob("*.gguf"))
+        if not parts:
+            return model_path
+        # Prefer first shard
+        ones = [p for p in parts if "00001-of-" in p.name or "-00001-" in p.name]
+        return str(ones[0] if ones else parts[0])
+    if path.is_file():
+        return str(path)
+    # Glob pattern
+    matches = sorted(Path().glob(model_path)) if any(c in model_path for c in "*?") else []
+    if matches:
+        return str(matches[0])
+    return model_path
+
+
+@dataclass
+class RamPlan:
+    n_ctx: int
+    n_batch: int
+    n_ubatch: int
+    n_predict: int
+    n_threads: int
+    cache_type_k: str
+    cache_type_v: str
+    note: str
+    model_mb: float
+    avail_mb: float
+    params_b_est: float
+    extreme: bool
+
+
+def plan_ram_budget(
+    model_path: str,
+    ram_budget_mb: int | None = None,
+    extreme: bool = False,
+    user_ctx: int | None = None,
+) -> RamPlan:
+    """
+    Choose ctx/batch so KV + working set fit a tight machine.
+
+    Strategy for huge models on small RAM:
+      - weights stay mmap'd (paged from disk)
+      - keep KV tiny (small n_ctx)
+      - tiny batch/ubatch to cut activation buffers
+      - never mlock
+    """
+    model_path = resolve_gguf_path(model_path)
+    m = mem_snapshot()
+    model_mb = file_mb(model_path)
+    avail = ram_budget_mb if ram_budget_mb and ram_budget_mb > 0 else m.sys_avail_mb
+    params_b = estimate_params_b(model_path)
+
+    # Headroom for OS + Python + fragmentation
+    headroom = 256.0 if extreme or avail < 4096 else 512.0
+    usable = max(128.0, avail - headroom)
+
+    # Heuristic KV budget: leave most of usable for weight pages under pressure
+    # Large model → prioritize weight paging → smaller KV share
+    if model_mb > usable * 0.8 or extreme:
+        kv_budget_mb = min(usable * 0.25, 512.0)
+        extreme = True
+    elif model_mb > 4000:
+        kv_budget_mb = min(usable * 0.35, 1536.0)
+    else:
+        kv_budget_mb = min(usable * 0.5, 4096.0)
+
+    # ~0.4–0.8 MB/token rough for 7–13B @ q8/f16 KV; scale with params
+    mb_per_tok = max(0.15, min(1.2, 0.08 * max(params_b, 1.0)))
+    max_ctx_by_ram = int(max(256, (kv_budget_mb / mb_per_tok) // 64 * 64))
+
+    if extreme:
+        n_ctx = min(user_ctx or 512, max_ctx_by_ram, 1024)
+        n_ctx = max(256, n_ctx)
+        n_batch = 16
+        n_ubatch = 8
+        n_predict = 96
+        n_threads = max(1, min(2, os.cpu_count() or 1))
+        note = "extreme-low-ram: tiny KV + batch; weights mmap-paged from disk"
+    elif model_mb >= 12000:  # ~20B+ Q4 class
+        n_ctx = min(user_ctx or 1024, max_ctx_by_ram, 2048)
+        n_batch, n_ubatch, n_predict = 32, 16, 128
+        n_threads = max(1, min(4, os.cpu_count() or 2))
+        note = "large-model profile (≥~12GB GGUF)"
+    elif model_mb >= 5000:
+        n_ctx = min(user_ctx or 2048, max_ctx_by_ram, 4096)
+        n_batch, n_ubatch, n_predict = 64, 32, 192
+        n_threads = max(1, min(4, os.cpu_count() or 2))
+        note = "medium-large model profile"
+    else:
+        n_ctx = min(user_ctx or DEFAULT_CTX, max_ctx_by_ram, 8192)
+        n_batch, n_ubatch, n_predict = 128, 32, 256
+        n_threads = max(1, min(4, os.cpu_count() or 2))
+        note = "standard low-ram profile"
+
+    if user_ctx:
+        n_ctx = min(user_ctx, max_ctx_by_ram)
+
+    return RamPlan(
+        n_ctx=int(n_ctx),
+        n_batch=int(n_batch),
+        n_ubatch=int(n_ubatch),
+        n_predict=int(n_predict),
+        n_threads=int(n_threads),
+        cache_type_k="q8_0",
+        cache_type_v="f16",
+        note=note,
+        model_mb=model_mb,
+        avail_mb=avail,
+        params_b_est=params_b,
+        extreme=extreme,
+    )
+
+
 
 
 # ============================== tools ======================================
@@ -651,6 +783,8 @@ class EngineConfig:
     max_retries: int = 1
     base_system: str = "You are a helpful assistant with tools."
     profile: str = "default"
+    extreme_low_ram: bool = False
+    ram_budget_mb: int = 0  # 0 = use MemAvailable
 
 
 @dataclass
@@ -670,6 +804,8 @@ class DiskChatEngine:
     def __init__(self, cfg: EngineConfig, tools: ToolRegistry | None = None):
         self.cfg = cfg
         self.tools = tools or ToolRegistry()
+        # Split / multi-part GGUF support
+        cfg.model_path = resolve_gguf_path(cfg.model_path)
         self.conv = Conversation(system=self._build_system())
         model = Path(cfg.model_path)
         cli = Path(cfg.llama_cli)
@@ -681,6 +817,25 @@ class DiskChatEngine:
         WORKSPACE.mkdir(parents=True, exist_ok=True)
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
         self._model_mb = file_mb(cfg.model_path)
+        self._ram_plan: RamPlan | None = None
+        if cfg.extreme_low_ram or cfg.ram_budget_mb > 0 or self._model_mb >= 5000:
+            plan = plan_ram_budget(
+                cfg.model_path,
+                ram_budget_mb=cfg.ram_budget_mb or None,
+                extreme=cfg.extreme_low_ram,
+                user_ctx=cfg.n_ctx,
+            )
+            self._ram_plan = plan
+            # Apply safer caps (never raise user intent above plan when extreme)
+            if cfg.extreme_low_ram or self._model_mb >= 5000:
+                cfg.n_ctx = min(cfg.n_ctx, plan.n_ctx)
+                cfg.n_batch = min(cfg.n_batch, plan.n_batch)
+                cfg.n_ubatch = min(cfg.n_ubatch, plan.n_ubatch)
+                cfg.n_threads = min(cfg.n_threads, plan.n_threads)
+                if cfg.extreme_low_ram:
+                    cfg.n_predict = min(cfg.n_predict, plan.n_predict)
+                    cfg.n_batch = plan.n_batch
+                    cfg.n_ubatch = plan.n_ubatch
 
     def _build_system(self) -> str:
         if self.cfg.agent_mode and self.tools.names():
@@ -722,9 +877,19 @@ class DiskChatEngine:
 
     def plan_ctx(self, prompt: str) -> int:
         need = approx_tokens(prompt) + self.cfg.n_predict + 64
-        floor = min(512, self.cfg.n_ctx)
+        floor = min(256 if self.cfg.extreme_low_ram else 512, self.cfg.n_ctx)
         planned = max(floor, min(need, self.cfg.n_ctx, self.cfg.max_context))
-        return int(min(((planned + 63) // 64) * 64, self.cfg.max_context))
+        planned = int(min(((planned + 63) // 64) * 64, self.cfg.max_context))
+        # Re-check against live available memory for huge models
+        if self.cfg.extreme_low_ram or self._model_mb >= 5000:
+            plan = plan_ram_budget(
+                self.cfg.model_path,
+                ram_budget_mb=self.cfg.ram_budget_mb or None,
+                extreme=self.cfg.extreme_low_ram,
+                user_ctx=planned,
+            )
+            planned = min(planned, plan.n_ctx)
+        return planned
 
     def _build_cmd(self, prompt: str, ctx: int) -> list[str]:
         c = self.cfg
@@ -924,6 +1089,20 @@ def run_doctor(cfg: EngineConfig) -> int:
             ok = False
     print(f"  workspace: {WORKSPACE}")
     print(f"  sessions : {SESSION_DIR}")
+    if model.is_file():
+        plan = plan_ram_budget(
+            str(model),
+            ram_budget_mb=cfg.ram_budget_mb or None,
+            extreme=cfg.extreme_low_ram,
+            user_ctx=cfg.n_ctx,
+        )
+        print(f"  params~  : {plan.params_b_est}B (from file size heuristic)")
+        print(f"  ram plan : ctx={plan.n_ctx} batch={plan.n_batch}/{plan.n_ubatch} "
+              f"threads={plan.n_threads} extreme={plan.extreme}")
+        print(f"  plan note: {plan.note}")
+        print(f"  avail    : {plan.avail_mb:.0f} MB  model_file={plan.model_mb:.0f} MB")
+        if plan.model_mb > plan.avail_mb:
+            print("  !! model file > available RAM — mmap will page from disk (slower, still works)")
     print("  status   :", "OK" if ok else "NEEDS SETUP")
     return 0 if ok else 1
 
@@ -1163,6 +1342,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--serve", action="store_true", help="start HTTP API for agents")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--extreme-low-ram", action="store_true",
+                    help="aggressive settings for huge GGUFs on small RAM (mmap paging)")
+    ap.add_argument("--ram-budget", type=int, default=0, metavar="MB",
+                    help="max RAM budget in MB (0 = auto from MemAvailable)")
     ap.add_argument("--version", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1195,7 +1378,27 @@ def main(argv: list[str] | None = None) -> int:
         system_prompt=prof["system_prompt"],
         base_system=prof["base_system"],
         profile=args.profile,
+        extreme_low_ram=args.extreme_low_ram,
+        ram_budget_mb=args.ram_budget,
     )
+    # Auto-apply planner when extreme or large model / budget set
+    if args.extreme_low_ram or args.ram_budget or file_mb(cfg.model_path) >= 5000:
+        plan = plan_ram_budget(
+            cfg.model_path,
+            ram_budget_mb=args.ram_budget or None,
+            extreme=args.extreme_low_ram,
+            user_ctx=cfg.n_ctx,
+        )
+        if args.extreme_low_ram:
+            cfg.n_ctx = plan.n_ctx
+            cfg.n_batch = plan.n_batch
+            cfg.n_ubatch = plan.n_ubatch
+            cfg.n_predict = min(cfg.n_predict, plan.n_predict)
+            cfg.n_threads = plan.n_threads
+        else:
+            cfg.n_ctx = min(cfg.n_ctx, plan.n_ctx)
+            cfg.n_batch = min(cfg.n_batch, plan.n_batch)
+            cfg.n_ubatch = min(cfg.n_ubatch, plan.n_ubatch)
 
     tools = ToolRegistry.with_builtins()
 
@@ -1217,6 +1420,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"KV      : {cfg.cache_type_k}/{cfg.cache_type_v}  agent={cfg.agent_mode}")
     print(f"tools   : {', '.join(tools.names())}")
     print(f"mmap    : ON  host: {mem_snapshot()}")
+    if cfg.extreme_low_ram or file_mb(cfg.model_path) >= 5000:
+        plan = plan_ram_budget(
+            cfg.model_path, cfg.ram_budget_mb or None, cfg.extreme_low_ram, cfg.n_ctx
+        )
+        print(f"ram plan: ctx={cfg.n_ctx} batch={cfg.n_batch}/{cfg.n_ubatch} "
+              f"~{plan.params_b_est}B  extreme={cfg.extreme_low_ram}")
+        print(f"         {plan.note}")
     print("cmds    : /reset /mem /tools /save [n] /load [n] /quit\n")
 
     try:

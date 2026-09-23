@@ -1,8 +1,10 @@
-# DiskChat Agent v2
+# DiskChat Agent v2.1
 
 **Ultra-low-RAM local LLM** with **tool calling** and an optional **HTTP API** for outer agents.
 
 Supports **Linux x86_64** and **Linux aarch64 (arm64)**.
+
+**v2.1:** extreme-low-RAM mode for **multi-GB / 7B–70B-class** GGUFs (auto RAM budget, tiny KV, mmap paging, split GGUF support).
 
 | Capability | Detail |
 |------------|--------|
@@ -125,6 +127,35 @@ reg.register("my_tool", lambda x="": {"ok": x}, "desc",
 ```
 
 ---
+
+
+---
+
+## Extreme low RAM (large models)
+
+DiskChat never `mlock`s weights. For **huge GGUFs** on small machines:
+
+```bash
+# Auto-tune ctx/batch from free RAM + model size
+python diskchat.py --extreme-low-ram --doctor
+python diskchat.py --extreme-low-ram --once "Hello"
+
+# Or set an explicit budget (MB)
+python diskchat.py --ram-budget 2048 --extreme-low-ram --agent
+
+# Large quant downloads (Q2/Q3 preferred)
+python scripts/download_model.py --preset large    # ~14B Q2
+python scripts/download_model.py --preset xlarge   # ~32B Q2
+```
+
+| Knob | Effect |
+|------|--------|
+| `--extreme-low-ram` | ctx≤1024, batch 16/8, few threads, small `n_predict` |
+| `--ram-budget MB` | plan KV from this ceiling instead of MemAvailable |
+| mmap weights | OS pages tensors from disk when RAM is tight |
+| split GGUF | pass `...-00001-of-00002.gguf` or a directory of shards |
+
+**Honest limit:** if the GGUF is much larger than physical RAM, inference **works** but becomes **disk-bound** (slow). Prefer **Q2/Q3** quants and **short context** on 8–16 GB hosts for 12B–32B models.
 
 ## Low RAM design
 
