@@ -1,0 +1,11 @@
+bin/
+.cache/
+models/
+*.gguf
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/
+*.bin
+.DS_Store

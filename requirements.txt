@@ -1,0 +1,3 @@
+# DiskChat only needs the stdlib at runtime.
+# Optional helper for model download:
+huggingface_hub>=0.20.0
