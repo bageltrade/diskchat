@@ -39,7 +39,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 
 def _project_root() -> Path:
@@ -74,6 +74,7 @@ def _default_paths() -> tuple[str, str, str]:
 
 
 DEFAULT_MODEL, DEFAULT_LLAMA_CLI, DEFAULT_LIB_DIR = _default_paths()
+WEB_DIR = _project_root() / "web"
 MAX_CONTEXT_CEILING = 131_072
 DEFAULT_CTX = 2048
 WORKSPACE = Path(
@@ -1417,21 +1418,70 @@ def make_handler() -> type[BaseHTTPRequestHandler]:
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
 
+        def _serve_file(self, path: Path, content_type: str) -> None:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                self._json(404, {"error": f"missing {path.name}"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+            if path in ("/", "/index.html", "/app", "/chat"):
+                self._serve_file(WEB_DIR / "index.html", "text/html; charset=utf-8")
+                return
+            if path.startswith("/static/"):
+                name = path[len("/static/"):]
+                # safe basename only
+                name = Path(name).name
+                fp = WEB_DIR / name
+                if name.endswith(".css"):
+                    self._serve_file(fp, "text/css; charset=utf-8")
+                elif name.endswith(".js"):
+                    self._serve_file(fp, "application/javascript; charset=utf-8")
+                else:
+                    self._json(404, {"error": "not found"})
+                return
             if path in ("/health", "/v1/health"):
+                eng = _ApiState.engine
                 self._json(200, {
                     "status": "ok",
                     "version": VERSION,
+                    "backend": "llama-cli",
+                    "model": eng.cfg.model_path if eng else None,
                     "mem": asdict(mem_snapshot()),
-                    "agent": bool(_ApiState.engine and _ApiState.engine.cfg.agent_mode),
+                    "agent": bool(eng and eng.cfg.agent_mode),
                 })
             elif path in ("/v1/tools", "/tools"):
                 tools = _ApiState.tools or ToolRegistry()
                 self._json(200, {"tools": tools.openai_tools()})
             elif path in ("/v1/models", "/models"):
+                self._json(200, {"models": list_gguf_models(limit=100)})
+            elif path in ("/v1/doctor", "/doctor"):
+                eng = _ApiState.engine
+                lines = [
+                    f"DiskChat doctor v{VERSION}",
+                    f"model: {eng.cfg.model_path if eng else '(none)'}",
+                    f"mem: {mem_snapshot()}",
+                ]
+                if eng:
+                    info = validate_split_gguf(eng.cfg.model_path)
+                    if info.get("split"):
+                        lines.append(
+                            f"split: {info['found']}/{info['expected']} ok={info['ok']}"
+                        )
+                self._json(200, {"text": "\n".join(lines), "mem": asdict(mem_snapshot())})
+            elif path in ("/v1/models/openai", "/v1/models/list"):
                 eng = _ApiState.engine
                 self._json(200, {
+                    "object": "list",
                     "data": [{
                         "id": "diskchat-local",
                         "model_path": eng.cfg.model_path if eng else None,

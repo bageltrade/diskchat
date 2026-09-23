@@ -184,3 +184,14 @@ python diskchat.py --gguf /models/partial-00001-of-00003.gguf --doctor
 ```
 
 `validate_split_gguf()` / `--doctor` report `found/expected` and total size across shards.
+
+## Web chat app (v2.5)
+
+Beautiful browser UI served by DiskChat itself:
+
+```bash
+python diskchat.py --serve --host 0.0.0.0 --port 8765 --extreme-low-ram
+# open http://127.0.0.1:8765/
+```
+
+Features: chat bubbles, model path / scan GGUF, agent toggle, extreme low RAM, doctor, health pill.
